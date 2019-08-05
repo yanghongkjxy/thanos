@@ -1,0 +1,5 @@
+thanosbench
+vendor/
+terraform/.terraform
+terraform/terraform.tfstate.backup
+.idea/

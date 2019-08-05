@@ -2,74 +2,134 @@ package main
 
 import (
 	"fmt"
+	"io/ioutil"
+	"strings"
 
-	"github.com/go-kit/kit/log"
-	"github.com/go-kit/kit/log/level"
-	"github.com/improbable-eng/thanos/pkg/cluster"
 	"github.com/pkg/errors"
-	"github.com/prometheus/client_golang/prometheus"
-	"gopkg.in/alecthomas/kingpin.v2"
+	"github.com/prometheus/common/model"
+	kingpin "gopkg.in/alecthomas/kingpin.v2"
 )
 
-func regCommonServerFlags(cmd *kingpin.CmdClause) (*string, *string, func(log.Logger, *prometheus.Registry, bool, string, bool) (*cluster.Peer, error)) {
-	grpcBindAddr := cmd.Flag("grpc-address", "Listen ip:port address for gRPC endpoints (StoreAPI). Make sure this address is routable from other components if you use gossip, 'grpc-advertise-address' is empty and you require cross-node connection.").
+func regGRPCFlags(cmd *kingpin.CmdClause) (
+	grpcBindAddr *string,
+	grpcTLSSrvCert *string,
+	grpcTLSSrvKey *string,
+	grpcTLSSrvClientCA *string,
+) {
+	grpcBindAddr = cmd.Flag("grpc-address", "Listen ip:port address for gRPC endpoints (StoreAPI). Make sure this address is routable from other components.").
 		Default("0.0.0.0:10901").String()
 
-	grpcAdvertiseAddr := cmd.Flag("grpc-advertise-address", "Explicit (external) host:port address to advertise for gRPC StoreAPI in gossip cluster. If empty, 'grpc-address' will be used.").
-		String()
+	grpcTLSSrvCert = cmd.Flag("grpc-server-tls-cert", "TLS Certificate for gRPC server, leave blank to disable TLS").Default("").String()
+	grpcTLSSrvKey = cmd.Flag("grpc-server-tls-key", "TLS Key for the gRPC server, leave blank to disable TLS").Default("").String()
+	grpcTLSSrvClientCA = cmd.Flag("grpc-server-tls-client-ca", "TLS CA to verify clients against. If no client CA is specified, there is no client verification on server side. (tls.NoClientCert)").Default("").String()
 
-	httpBindAddr := regHTTPAddrFlag(cmd)
+	return grpcBindAddr,
+		grpcTLSSrvCert,
+		grpcTLSSrvKey,
+		grpcTLSSrvClientCA
+}
 
-	clusterBindAddr := cmd.Flag("cluster.address", "Listen ip:port address for gossip cluster.").
-		Default("0.0.0.0:10900").String()
-
-	clusterAdvertiseAddr := cmd.Flag("cluster.advertise-address", "Explicit (external) ip:port address to advertise for gossip in gossip cluster. Used internally for membership only").
-		String()
-
-	peers := cmd.Flag("cluster.peers", "Initial peers to join the cluster. It can be either <ip:port>, or <domain:port>. A lookup resolution is done only at the startup.").Strings()
-
-	gossipInterval := cmd.Flag("cluster.gossip-interval", "Interval between sending gossip messages. By lowering this value (more frequent) gossip messages are propagated across the cluster more quickly at the expense of increased bandwidth.").
-		Default(cluster.DefaultGossipInterval.String()).Duration()
-
-	pushPullInterval := cmd.Flag("cluster.pushpull-interval", "Interval for gossip state syncs. Setting this interval lower (more frequent) will increase convergence speeds across larger clusters at the expense of increased bandwidth usage.").
-		Default(cluster.DefaultPushPullInterval.String()).Duration()
+// TODO(povilasv): we don't need this anymore.
+func regCommonServerFlags(cmd *kingpin.CmdClause) (
+	grpcBindAddr *string,
+	httpBindAddr *string,
+	grpcTLSSrvCert *string,
+	grpcTLSSrvKey *string,
+	grpcTLSSrvClientCA *string) {
+	httpBindAddr = regHTTPAddrFlag(cmd)
+	grpcBindAddr, grpcTLSSrvCert, grpcTLSSrvKey, grpcTLSSrvClientCA = regGRPCFlags(cmd)
 
 	return grpcBindAddr,
 		httpBindAddr,
-		func(logger log.Logger, reg *prometheus.Registry, waitIfEmpty bool, httpAdvertiseAddr string, queryAPIEnabled bool) (*cluster.Peer, error) {
-			host, port, err := cluster.CalculateAdvertiseAddress(*grpcBindAddr, *grpcAdvertiseAddr)
-			if err != nil {
-				return nil, errors.Wrapf(err, "calculate advertise StoreAPI addr for gossip based on bindAddr: %s and advAddr: %s", *grpcBindAddr, *grpcAdvertiseAddr)
-			}
-
-			advStoreAPIAddress := fmt.Sprintf("%s:%d", host, port)
-			if cluster.IsUnroutable(advStoreAPIAddress) {
-				level.Warn(logger).Log("msg", "this component advertises its gRPC StoreAPI on an unroutable address. This will not work cross-cluster", "addr", advStoreAPIAddress)
-				level.Warn(logger).Log("msg", "provide --grpc-address as routable ip:port or --grpc-advertise-address as a routable host:port")
-			}
-
-			level.Info(logger).Log("msg", "StoreAPI address that will be propagated through gossip", "address", advStoreAPIAddress)
-
-			advQueryAPIAddress := httpAdvertiseAddr
-			if queryAPIEnabled {
-				host, port, err := cluster.CalculateAdvertiseAddress(*httpBindAddr, advQueryAPIAddress)
-				if err != nil {
-					return nil, errors.Wrapf(err, "calculate advertise QueryAPI addr for gossip based on bindAddr: %s and advAddr: %s", *httpBindAddr, advQueryAPIAddress)
-				}
-
-				advQueryAPIAddress = fmt.Sprintf("%s:%d", host, port)
-				if cluster.IsUnroutable(advQueryAPIAddress) {
-					level.Warn(logger).Log("msg", "this component advertises its HTTP QueryAPI on an unroutable address. This will not work cross-cluster", "addr", advQueryAPIAddress)
-					level.Warn(logger).Log("msg", "provide --http-address as routable ip:port or --http-advertise-address as a routable host:port")
-				}
-
-				level.Info(logger).Log("msg", "QueryAPI address that will be propagated through gossip", "address", advQueryAPIAddress)
-			}
-
-			return cluster.New(logger, reg, *clusterBindAddr, *clusterAdvertiseAddr, advStoreAPIAddress, advQueryAPIAddress, *peers, waitIfEmpty, *gossipInterval, *pushPullInterval)
-		}
+		grpcTLSSrvCert,
+		grpcTLSSrvKey,
+		grpcTLSSrvClientCA
 }
 
 func regHTTPAddrFlag(cmd *kingpin.CmdClause) *string {
 	return cmd.Flag("http-address", "Listen host:port for HTTP endpoints.").Default("0.0.0.0:10902").String()
+}
+
+func modelDuration(flags *kingpin.FlagClause) *model.Duration {
+	value := new(model.Duration)
+	flags.SetValue(value)
+
+	return value
+}
+
+type pathOrContent struct {
+	fileFlagName    string
+	contentFlagName string
+
+	required bool
+	path     *string
+	content  *string
+}
+
+// Content returns content of the file. Flag that specifies path has priority.
+// It returns error if the content is empty and required flag is set to true.
+func (p *pathOrContent) Content() ([]byte, error) {
+	if len(*p.path) > 0 && len(*p.content) > 0 {
+		return nil, errors.Errorf("Both %s and %s flags set.", p.fileFlagName, p.contentFlagName)
+	}
+
+	var content []byte
+	if len(*p.path) > 0 {
+		c, err := ioutil.ReadFile(*p.path)
+		if err != nil {
+			return nil, errors.Wrapf(err, "loading YAML file %s for %s", *p.path, p.fileFlagName)
+		}
+		content = c
+	} else {
+		content = []byte(*p.content)
+	}
+
+	if len(content) == 0 && p.required {
+		return nil, errors.Errorf("flag %s or %s is required for running this command and content cannot be empty.", p.fileFlagName, p.contentFlagName)
+	}
+
+	return content, nil
+}
+
+func regCommonObjStoreFlags(cmd *kingpin.CmdClause, suffix string, required bool, extraDesc ...string) *pathOrContent {
+	fileFlagName := fmt.Sprintf("objstore%s.config-file", suffix)
+	contentFlagName := fmt.Sprintf("objstore%s.config", suffix)
+
+	help := fmt.Sprintf("Path to YAML file that contains object store%s configuration.", suffix)
+	help = strings.Join(append([]string{help}, extraDesc...), " ")
+	bucketConfFile := cmd.Flag(fileFlagName, help).PlaceHolder("<bucket.config-yaml-path>").String()
+
+	help = fmt.Sprintf("Alternative to '%s' flag. Object store%s configuration in YAML.", fileFlagName, suffix)
+	help = strings.Join(append([]string{help}, extraDesc...), " ")
+	bucketConf := cmd.Flag(contentFlagName, help).
+		PlaceHolder("<bucket.config-yaml>").String()
+
+	return &pathOrContent{
+		fileFlagName:    fileFlagName,
+		contentFlagName: contentFlagName,
+		required:        required,
+
+		path:    bucketConfFile,
+		content: bucketConf,
+	}
+}
+
+func regCommonTracingFlags(app *kingpin.Application) *pathOrContent {
+	fileFlagName := fmt.Sprintf("tracing.config-file")
+	contentFlagName := fmt.Sprintf("tracing.config")
+
+	help := fmt.Sprintf("Path to YAML file that contains tracing configuration.")
+	tracingConfFile := app.Flag(fileFlagName, help).PlaceHolder("<tracing.config-yaml-path>").String()
+
+	help = fmt.Sprintf("Alternative to '%s' flag. Tracing configuration in YAML.", fileFlagName)
+	tracingConf := app.Flag(contentFlagName, help).PlaceHolder("<tracing.config-yaml>").String()
+
+	return &pathOrContent{
+		fileFlagName:    fileFlagName,
+		contentFlagName: contentFlagName,
+		required:        false,
+
+		path:    tracingConfFile,
+		content: tracingConf,
+	}
 }

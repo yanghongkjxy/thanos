@@ -3,11 +3,12 @@ package objtesting
 import (
 	"context"
 	"io/ioutil"
+	"sort"
 	"strings"
 	"testing"
 
-	"github.com/improbable-eng/thanos/pkg/objstore"
-	"github.com/improbable-eng/thanos/pkg/testutil"
+	"github.com/thanos-io/thanos/pkg/objstore"
+	"github.com/thanos-io/thanos/pkg/testutil"
 )
 
 // TestObjStoreAcceptanceTest_e2e tests all known implementation against interface behaviour contract we agreed on.
@@ -34,14 +35,14 @@ func TestObjStore_AcceptanceTest_e2e(t *testing.T) {
 		// Double check we can immediately read it.
 		rc1, err := bkt.Get(context.Background(), "id1/obj_1.some")
 		testutil.Ok(t, err)
-		defer rc1.Close()
+		defer func() { testutil.Ok(t, rc1.Close()) }()
 		content, err := ioutil.ReadAll(rc1)
 		testutil.Ok(t, err)
 		testutil.Equals(t, "@test-data@", string(content))
 
 		rc2, err := bkt.GetRange(context.Background(), "id1/obj_1.some", 1, 3)
 		testutil.Ok(t, err)
-		defer rc2.Close()
+		defer func() { testutil.Ok(t, rc2.Close()) }()
 		content, err = ioutil.ReadAll(rc2)
 		testutil.Ok(t, err)
 		testutil.Equals(t, "tes", string(content))
@@ -62,7 +63,10 @@ func TestObjStore_AcceptanceTest_e2e(t *testing.T) {
 			seen = append(seen, fn)
 			return nil
 		}))
-		testutil.Equals(t, []string{"obj_5.some", "id1/", "id2/"}, seen)
+		expected := []string{"obj_5.some", "id1/", "id2/"}
+		sort.Strings(expected)
+		sort.Strings(seen)
+		testutil.Equals(t, expected, seen)
 
 		// Can we iter over items from id1/ dir?
 		seen = []string{}

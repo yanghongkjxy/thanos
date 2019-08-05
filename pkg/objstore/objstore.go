@@ -8,13 +8,17 @@ import (
 	"strings"
 	"time"
 
+	"github.com/go-kit/kit/log"
+	"github.com/go-kit/kit/log/level"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/thanos-io/thanos/pkg/runutil"
 )
 
 // Bucket provides read and write access to an object storage bucket.
 // NOTE: We assume strong consistency for write-read flow.
 type Bucket interface {
+	io.Closer
 	BucketReader
 
 	// Upload the contents of the reader as an object into the bucket.
@@ -22,6 +26,9 @@ type Bucket interface {
 
 	// Delete removes the object with the given name.
 	Delete(ctx context.Context, name string) error
+
+	// Name returns the bucket name for the provider.
+	Name() string
 }
 
 // BucketReader provides read access to an object storage bucket.
@@ -45,8 +52,8 @@ type BucketReader interface {
 }
 
 // UploadDir uploads all files in srcdir to the bucket with into a top-level directory
-// named dstdir.
-func UploadDir(ctx context.Context, bkt Bucket, srcdir, dstdir string) error {
+// named dstdir. It is a caller responsibility to clean partial upload in case of failure.
+func UploadDir(ctx context.Context, logger log.Logger, bkt Bucket, srcdir, dstdir string) error {
 	df, err := os.Stat(srcdir)
 	if err != nil {
 		return errors.Wrap(err, "stat dir")
@@ -63,17 +70,18 @@ func UploadDir(ctx context.Context, bkt Bucket, srcdir, dstdir string) error {
 		}
 		dst := filepath.Join(dstdir, strings.TrimPrefix(src, srcdir))
 
-		return UploadFile(ctx, bkt, src, dst)
+		return UploadFile(ctx, logger, bkt, src, dst)
 	})
 }
 
 // UploadFile uploads the file with the given name to the bucket.
-func UploadFile(ctx context.Context, bkt Bucket, src, dst string) error {
+// It is a caller responsibility to clean partial upload in case of failure
+func UploadFile(ctx context.Context, logger log.Logger, bkt Bucket, src, dst string) error {
 	r, err := os.Open(src)
 	if err != nil {
 		return errors.Wrapf(err, "open file %s", src)
 	}
-	defer r.Close()
+	defer runutil.CloseWithLogOnErr(logger, r, "close file %s", src)
 
 	if err := bkt.Upload(ctx, dst, r); err != nil {
 		return errors.Wrapf(err, "upload file %s as %s", src, dst)
@@ -86,19 +94,19 @@ const DirDelim = "/"
 
 // DeleteDir removes all objects prefixed with dir from the bucket.
 func DeleteDir(ctx context.Context, bkt Bucket, dir string) error {
-	bkt.Iter(ctx, dir, func(name string) error {
+	return bkt.Iter(ctx, dir, func(name string) error {
 		// If we hit a directory, call DeleteDir recursively.
 		if strings.HasSuffix(name, DirDelim) {
 			return DeleteDir(ctx, bkt, name)
 		}
 		return bkt.Delete(ctx, name)
 	})
-	return nil
 }
 
 // DownloadFile downloads the src file from the bucket to dst. If dst is an existing
 // directory, a file with the same name as the source is created in dst.
-func DownloadFile(ctx context.Context, bkt BucketReader, src, dst string) error {
+// If destination file is already existing, download file will overwrite it.
+func DownloadFile(ctx context.Context, logger log.Logger, bkt BucketReader, src, dst string) (err error) {
 	if fi, err := os.Stat(dst); err == nil {
 		if fi.IsDir() {
 			dst = filepath.Join(dst, filepath.Base(src))
@@ -111,19 +119,21 @@ func DownloadFile(ctx context.Context, bkt BucketReader, src, dst string) error 
 	if err != nil {
 		return errors.Wrap(err, "get file")
 	}
-	defer rc.Close()
+	defer runutil.CloseWithLogOnErr(logger, rc, "download block's file reader")
 
 	f, err := os.Create(dst)
 	if err != nil {
 		return errors.Wrap(err, "create file")
 	}
 	defer func() {
-		f.Close()
-		// Best-effort cleanup.
 		if err != nil {
-			os.Remove(dst)
+			if rerr := os.Remove(dst); rerr != nil {
+				level.Warn(logger).Log("msg", "failed to remove partially downloaded file", "file", dst, "err", rerr)
+			}
 		}
 	}()
+	defer runutil.CloseWithLogOnErr(logger, f, "download block's output file")
+
 	if _, err = io.Copy(f, rc); err != nil {
 		return errors.Wrap(err, "copy object to file")
 	}
@@ -131,21 +141,50 @@ func DownloadFile(ctx context.Context, bkt BucketReader, src, dst string) error 
 }
 
 // DownloadDir downloads all object found in the directory into the local directory.
-func DownloadDir(ctx context.Context, bkt BucketReader, src, dst string) error {
+func DownloadDir(ctx context.Context, logger log.Logger, bkt BucketReader, src, dst string) error {
 	if err := os.MkdirAll(dst, 0777); err != nil {
 		return errors.Wrap(err, "create dir")
 	}
-	err := bkt.Iter(ctx, src, func(name string) error {
+
+	var downloadedFiles []string
+	if err := bkt.Iter(ctx, src, func(name string) error {
 		if strings.HasSuffix(name, DirDelim) {
-			return DownloadDir(ctx, bkt, name, filepath.Join(dst, filepath.Base(name)))
+			return DownloadDir(ctx, logger, bkt, name, filepath.Join(dst, filepath.Base(name)))
 		}
-		return DownloadFile(ctx, bkt, name, dst)
-	})
-	// Best-effort cleanup if the download failed.
-	if err != nil {
-		os.RemoveAll(dst)
+		if err := DownloadFile(ctx, logger, bkt, name, dst); err != nil {
+			return err
+		}
+
+		downloadedFiles = append(downloadedFiles, dst)
+		return nil
+	}); err != nil {
+		// Best-effort cleanup if the download failed.
+		for _, f := range downloadedFiles {
+			if rerr := os.Remove(f); rerr != nil {
+				level.Warn(logger).Log("msg", "failed to remove file on partial dir download error", "file", f, "err", rerr)
+			}
+		}
+		return err
 	}
-	return err
+
+	return nil
+}
+
+// Exists returns true, if file exists, otherwise false and nil error if presence IsObjNotFoundErr, otherwise false with
+// returning error.
+func Exists(ctx context.Context, bkt Bucket, src string) (bool, error) {
+	rc, err := bkt.Get(ctx, src)
+	if rc != nil {
+		_ = rc.Close()
+	}
+	if err != nil {
+		if bkt.IsObjNotFoundErr(err) {
+			return false, nil
+		}
+		return false, errors.Wrap(err, "stat object")
+	}
+
+	return true, nil
 }
 
 // BucketWithMetrics takes a bucket and registers metrics with the given registry for
@@ -172,10 +211,10 @@ func BucketWithMetrics(name string, b Bucket, r prometheus.Registerer) Bucket {
 			ConstLabels: prometheus.Labels{"bucket": name},
 			Buckets:     []float64{0.005, 0.01, 0.02, 0.04, 0.08, 0.15, 0.3, 0.6, 1, 1.5, 2.5, 5, 10, 20, 30},
 		}, []string{"operation"}),
-		lastSuccessfullUploadTime: prometheus.NewGauge(prometheus.GaugeOpts{
-			Name:        "thanos_objstore_bucket_last_successful_upload_time",
-			Help:        "Second timestamp of the last successful upload to the bucket.",
-			ConstLabels: prometheus.Labels{"bucket": name}}),
+		lastSuccessfullUploadTime: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "thanos_objstore_bucket_last_successful_upload_time",
+			Help: "Second timestamp of the last successful upload to the bucket.",
+		}, []string{"bucket"}),
 	}
 	if r != nil {
 		r.MustRegister(bkt.ops, bkt.opsFailures, bkt.opsDuration, bkt.lastSuccessfullUploadTime)
@@ -189,7 +228,7 @@ type metricBucket struct {
 	ops                       *prometheus.CounterVec
 	opsFailures               *prometheus.CounterVec
 	opsDuration               *prometheus.HistogramVec
-	lastSuccessfullUploadTime prometheus.Gauge
+	lastSuccessfullUploadTime *prometheus.GaugeVec
 }
 
 func (b *metricBucket) Iter(ctx context.Context, dir string, f func(name string) error) error {
@@ -213,8 +252,12 @@ func (b *metricBucket) Get(ctx context.Context, name string) (io.ReadCloser, err
 		b.opsFailures.WithLabelValues(op).Inc()
 		return nil, err
 	}
-	rc = newTimingReadCloser(rc,
-		b.opsDuration.WithLabelValues(op), b.opsFailures.WithLabelValues(op))
+	rc = newTimingReadCloser(
+		rc,
+		op,
+		b.opsDuration,
+		b.opsFailures,
+	)
 
 	return rc, nil
 }
@@ -228,8 +271,12 @@ func (b *metricBucket) GetRange(ctx context.Context, name string, off, length in
 		b.opsFailures.WithLabelValues(op).Inc()
 		return nil, err
 	}
-	rc = newTimingReadCloser(rc,
-		b.opsDuration.WithLabelValues(op), b.opsFailures.WithLabelValues(op))
+	rc = newTimingReadCloser(
+		rc,
+		op,
+		b.opsDuration,
+		b.opsFailures,
+	)
 
 	return rc, nil
 }
@@ -257,7 +304,7 @@ func (b *metricBucket) Upload(ctx context.Context, name string, r io.Reader) err
 		b.opsFailures.WithLabelValues(op).Inc()
 	} else {
 		//TODO: Use SetToCurrentTime() once we update the Prometheus client_golang
-		b.lastSuccessfullUploadTime.Set(float64(time.Now().UnixNano()) / 1e9)
+		b.lastSuccessfullUploadTime.WithLabelValues(b.bkt.Name()).Set(float64(time.Now().UnixNano()) / 1e9)
 	}
 	b.ops.WithLabelValues(op).Inc()
 	b.opsDuration.WithLabelValues(op).Observe(time.Since(start).Seconds())
@@ -283,20 +330,33 @@ func (b *metricBucket) IsObjNotFoundErr(err error) bool {
 	return b.bkt.IsObjNotFoundErr(err)
 }
 
+func (b *metricBucket) Close() error {
+	return b.bkt.Close()
+}
+
+func (b *metricBucket) Name() string {
+	return b.bkt.Name()
+}
+
 type timingReadCloser struct {
 	io.ReadCloser
 
 	ok       bool
 	start    time.Time
-	duration prometheus.Histogram
-	failed   prometheus.Counter
+	op       string
+	duration *prometheus.HistogramVec
+	failed   *prometheus.CounterVec
 }
 
-func newTimingReadCloser(rc io.ReadCloser, dur prometheus.Histogram, failed prometheus.Counter) *timingReadCloser {
+func newTimingReadCloser(rc io.ReadCloser, op string, dur *prometheus.HistogramVec, failed *prometheus.CounterVec) *timingReadCloser {
+	// Initialize the metrics with 0.
+	dur.WithLabelValues(op)
+	failed.WithLabelValues(op)
 	return &timingReadCloser{
 		ReadCloser: rc,
 		ok:         true,
 		start:      time.Now(),
+		op:         op,
 		duration:   dur,
 		failed:     failed,
 	}
@@ -304,9 +364,9 @@ func newTimingReadCloser(rc io.ReadCloser, dur prometheus.Histogram, failed prom
 
 func (rc *timingReadCloser) Close() error {
 	err := rc.ReadCloser.Close()
-	rc.duration.Observe(time.Since(rc.start).Seconds())
+	rc.duration.WithLabelValues(rc.op).Observe(time.Since(rc.start).Seconds())
 	if rc.ok && err != nil {
-		rc.failed.Inc()
+		rc.failed.WithLabelValues(rc.op).Inc()
 		rc.ok = false
 	}
 	return err
@@ -315,7 +375,7 @@ func (rc *timingReadCloser) Close() error {
 func (rc *timingReadCloser) Read(b []byte) (n int, err error) {
 	n, err = rc.ReadCloser.Read(b)
 	if rc.ok && err != nil && err != io.EOF {
-		rc.failed.Inc()
+		rc.failed.WithLabelValues(rc.op).Inc()
 		rc.ok = false
 	}
 	return n, err

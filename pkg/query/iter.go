@@ -3,14 +3,13 @@ package query
 import (
 	"math"
 	"sort"
-	"unsafe"
 
-	"github.com/improbable-eng/thanos/pkg/compact/downsample"
-	"github.com/improbable-eng/thanos/pkg/store/storepb"
 	"github.com/pkg/errors"
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/tsdb/chunkenc"
+	"github.com/thanos-io/thanos/pkg/compact/downsample"
+	"github.com/thanos-io/thanos/pkg/store/storepb"
 )
 
 // promSeriesSet implements the SeriesSet interface of the Prometheus storage
@@ -98,8 +97,9 @@ func newChunkSeries(lset []storepb.Label, chunks []storepb.AggrChunk, mint, maxt
 	sort.Slice(chunks, func(i, j int) bool {
 		return chunks[i].MinTime < chunks[j].MinTime
 	})
+
 	return &chunkSeries{
-		lset:   *(*labels.Labels)(unsafe.Pointer(&lset)), // YOLO!
+		lset:   storepb.LabelsToPromLabels(lset),
 		chunks: chunks,
 		mint:   mint,
 		maxt:   maxt,
@@ -395,7 +395,6 @@ func (s *dedupSeries) Iterator() (it storage.SeriesIterator) {
 
 type dedupSeriesIterator struct {
 	a, b storage.SeriesIterator
-	i    int
 
 	aok, bok   bool
 	lastT      int64

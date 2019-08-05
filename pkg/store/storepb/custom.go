@@ -2,7 +2,17 @@ package storepb
 
 import (
 	"strings"
+
+	"github.com/prometheus/prometheus/pkg/labels"
 )
+
+var PartialResponseStrategyValues = func() []string {
+	var s []string
+	for k := range PartialResponseStrategy_value {
+		s = append(s, k)
+	}
+	return s
+}()
 
 func NewWarnSeriesResponse(err error) *SeriesResponse {
 	return &SeriesResponse{
@@ -149,4 +159,29 @@ func (s *mergedSeriesSet) Next() bool {
 		s.bdone = !s.b.Next()
 	}
 	return true
+}
+
+func LabelsToPromLabels(lset []Label) labels.Labels {
+	ret := make(labels.Labels, len(lset))
+	for i, l := range lset {
+		ret[i] = labels.Label{Name: l.Name, Value: l.Value}
+	}
+
+	return ret
+}
+
+func LabelsToString(lset []Label) string {
+	var s []string
+	for _, l := range lset {
+		s = append(s, l.String())
+	}
+	return "[" + strings.Join(s, ",") + "]"
+}
+
+func LabelSetsToString(lsets []LabelSet) string {
+	s := []string{}
+	for _, ls := range lsets {
+		s = append(s, LabelsToString(ls.Labels))
+	}
+	return strings.Join(s, "")
 }

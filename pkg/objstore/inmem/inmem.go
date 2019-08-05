@@ -9,8 +9,8 @@ import (
 	"io/ioutil"
 	"strings"
 
-	"github.com/improbable-eng/thanos/pkg/objstore"
 	"github.com/pkg/errors"
+	"github.com/thanos-io/thanos/pkg/objstore"
 )
 
 var errNotFound = errors.New("inmem: object not found")
@@ -142,4 +142,11 @@ func (b *Bucket) Delete(_ context.Context, name string) error {
 // IsObjNotFoundErr returns true if error means that object is not found. Relevant to Get operations.
 func (b *Bucket) IsObjNotFoundErr(err error) bool {
 	return err == errNotFound
+}
+
+func (b *Bucket) Close() error { return nil }
+
+// Name returns the bucket name.
+func (b *Bucket) Name() string {
+	return "inmem"
 }

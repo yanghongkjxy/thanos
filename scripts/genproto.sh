@@ -5,35 +5,39 @@
 set -e
 set -u
 
+PROTOC_BIN=${PROTOC_BIN:-protoc}
+GOIMPORTS_BIN=${GOIMPORTS_BIN:-goimports}
+
 if ! [[ "$0" =~ "scripts/genproto.sh" ]]; then
 	echo "must be run from repository root"
 	exit 255
 fi
 
-if ! [[ $(protoc --version) =~ "3.4.0" ]]; then
+if ! [[ $(${PROTOC_BIN} --version) =~ "3.4.0" ]]; then
 	echo "could not find protoc 3.4.0, is it installed + in PATH?"
 	exit 255
 fi
 
-THANOS_ROOT="${GOPATH}/src/github.com/improbable-eng/thanos"
-PROM_PATH="${THANOS_ROOT}/pkg/store/storepb"
-GOGOPROTO_ROOT="${GOPATH}/src/github.com/gogo/protobuf"
+echo "installing gogofast"
+GO111MODULE=on go install "github.com/gogo/protobuf/protoc-gen-gogofast"
+
+PROM_PATH="$(pwd)/pkg/store/prompb"
+GOGOPROTO_ROOT="$(GO111MODULE=on go list -f '{{ .Dir }}' -m github.com/gogo/protobuf)"
 GOGOPROTO_PATH="${GOGOPROTO_ROOT}:${GOGOPROTO_ROOT}/protobuf"
-GRPC_GATEWAY_ROOT="${GOPATH}/src/github.com/grpc-ecosystem/grpc-gateway"
 
 DIRS="pkg/store/storepb pkg/store/prompb"
 
+echo "generating code"
 for dir in ${DIRS}; do
 	pushd ${dir}
-		protoc --gogofast_out=plugins=grpc:. -I=. \
+		${PROTOC_BIN} --gogofast_out=plugins=grpc:. -I=. \
             -I="${GOGOPROTO_PATH}" \
             -I="${PROM_PATH}" \
-            -I="${GRPC_GATEWAY_ROOT}/third_party/googleapis" \
             *.proto
 
 		sed -i.bak -E 's/import _ \"gogoproto\"//g' *.pb.go
 		sed -i.bak -E 's/import _ \"google\/protobuf\"//g' *.pb.go
 		rm -f *.bak
-		goimports -w *.pb.go
+		${GOIMPORTS_BIN} -w *.pb.go
 	popd
 done

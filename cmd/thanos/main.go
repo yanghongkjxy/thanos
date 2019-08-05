@@ -2,7 +2,11 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
+	"io"
+	"io/ioutil"
 	"math"
 	"net"
 	"net/http"
@@ -15,24 +19,32 @@ import (
 	"syscall"
 
 	gmetrics "github.com/armon/go-metrics"
-
 	gprom "github.com/armon/go-metrics/prometheus"
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
 	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware"
 	grpc_recovery "github.com/grpc-ecosystem/go-grpc-middleware/recovery"
-	"github.com/grpc-ecosystem/go-grpc-prometheus"
-	"github.com/improbable-eng/thanos/pkg/tracing"
+	grpc_prometheus "github.com/grpc-ecosystem/go-grpc-prometheus"
 	"github.com/oklog/run"
 	"github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/prometheus/common/version"
+	"github.com/thanos-io/thanos/pkg/prober"
+	"github.com/thanos-io/thanos/pkg/runutil"
+	"github.com/thanos-io/thanos/pkg/tracing"
+	"github.com/thanos-io/thanos/pkg/tracing/client"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/status"
-	kingpin "gopkg.in/alecthomas/kingpin.v2"
+	"gopkg.in/alecthomas/kingpin.v2"
+)
+
+const (
+	logFormatLogfmt = "logfmt"
+	logFormatJson   = "json"
 )
 
 type setupFunc func(*run.Group, log.Logger, *prometheus.Registry, opentracing.Tracer, bool) error
@@ -52,20 +64,21 @@ func main() {
 
 	logLevel := app.Flag("log.level", "Log filtering level.").
 		Default("info").Enum("error", "warn", "info", "debug")
+	logFormat := app.Flag("log.format", "Log format to use.").
+		Default(logFormatLogfmt).Enum(logFormatLogfmt, logFormatJson)
 
-	gcloudTraceProject := app.Flag("gcloudtrace.project", "GCP project to send Google Cloud Trace tracings to. If empty, tracing will be disabled.").
-		String()
-	gcloudTraceSampleFactor := app.Flag("gcloudtrace.sample-factor", "How often we send traces (1/<sample-factor>). If 0 no trace will be sent periodically, unless forced by baggage item. See `pkg/tracing/tracing.go` for details.").
-		Default("1").Uint64()
+	tracingConfig := regCommonTracingFlags(app)
 
 	cmds := map[string]setupFunc{}
 	registerSidecar(cmds, app, "sidecar")
 	registerStore(cmds, app, "store")
 	registerQuery(cmds, app, "query")
 	registerRule(cmds, app, "rule")
-	registerCompact(cmds, app, "compact")
+	registerCompact(cmds, app)
 	registerBucket(cmds, app, "bucket")
 	registerDownsample(cmds, app, "downsample")
+	registerReceive(cmds, app, "receive")
+	registerChecks(cmds, app, "check")
 
 	cmd, err := app.Parse(os.Args[1:])
 	if err != nil {
@@ -90,6 +103,9 @@ func main() {
 			panic("unexpected log level")
 		}
 		logger = log.NewLogfmtLogger(log.NewSyncWriter(os.Stderr))
+		if *logFormat == logFormatJson {
+			logger = log.NewJSONLogger(log.NewSyncWriter(os.Stderr))
+		}
 		logger = level.NewFilter(logger, lvl)
 
 		if *debugName != "" {
@@ -103,17 +119,19 @@ func main() {
 	metrics.MustRegister(
 		version.NewCollector("thanos"),
 		prometheus.NewGoCollector(),
+		prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}),
 	)
 
 	prometheus.DefaultRegisterer = metrics
-	// Memberlist uses go-metrics
+	// Memberlist uses go-metrics.
 	sink, err := gprom.NewPrometheusSink()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, errors.Wrapf(err, "%s command failed", cmd))
 		os.Exit(1)
 	}
-	_, err = gmetrics.NewGlobal(gmetrics.DefaultConfig(cmd), sink)
-	if err != nil {
+	gmetricsConfig := gmetrics.DefaultConfig("thanos_" + cmd)
+	gmetricsConfig.EnableRuntimeMetrics = false
+	if _, err = gmetrics.NewGlobal(gmetricsConfig, sink); err != nil {
 		fmt.Fprintln(os.Stderr, errors.Wrapf(err, "%s command failed", cmd))
 		os.Exit(1)
 	}
@@ -125,21 +143,46 @@ func main() {
 	{
 		ctx := context.Background()
 
-		var closeFn func() error
-		tracer, closeFn = tracing.NewOptionalGCloudTracer(ctx, logger, *gcloudTraceProject, *gcloudTraceSampleFactor, *debugName)
+		var closer io.Closer
+		var confContentYaml []byte
+		confContentYaml, err = tracingConfig.Content()
+		if err != nil {
+			level.Error(logger).Log("msg", "getting tracing config failed", "err", err)
+			os.Exit(1)
+		}
+
+		if len(confContentYaml) == 0 {
+			level.Info(logger).Log("msg", "Tracing will be disabled")
+			tracer = client.NoopTracer()
+		} else {
+			tracer, closer, err = client.NewTracer(ctx, logger, metrics, confContentYaml)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, errors.Wrapf(err, "tracing failed"))
+				os.Exit(1)
+			}
+		}
+
+		// This is bad, but Prometheus does not support any other tracer injections than just global one.
+		// TODO(bplotka): Work with basictracer to handle gracefully tracker mismatches, and also with Prometheus to allow
+		// tracer injection.
+		opentracing.SetGlobalTracer(tracer)
 
 		ctx, cancel := context.WithCancel(ctx)
 		g.Add(func() error {
 			<-ctx.Done()
 			return ctx.Err()
 		}, func(error) {
-			closeFn()
+			if closer != nil {
+				if err := closer.Close(); err != nil {
+					level.Warn(logger).Log("msg", "closing tracer failed", "err", err)
+				}
+			}
 			cancel()
 		})
 	}
 
 	if err := cmds[cmd](&g, logger, metrics, tracer, *logLevel == "debug"); err != nil {
-		fmt.Fprintln(os.Stderr, errors.Wrapf(err, "%s command failed", cmd))
+		level.Error(logger).Log("err", errors.Wrapf(err, "%s command failed", cmd))
 		os.Exit(1)
 	}
 
@@ -192,7 +235,7 @@ func registerMetrics(mux *http.ServeMux, g prometheus.Gatherer) {
 // - request histogram
 // - tracing
 // - panic recovery with panic counter
-func defaultGRPCServerOpts(logger log.Logger, reg *prometheus.Registry, tracer opentracing.Tracer) []grpc.ServerOption {
+func defaultGRPCServerOpts(logger log.Logger, reg *prometheus.Registry, tracer opentracing.Tracer, cert, key, clientCA string) ([]grpc.ServerOption, error) {
 	met := grpc_prometheus.NewServerMetrics()
 	met.EnableHandlingTimeHistogram(
 		grpc_prometheus.WithHistogramBuckets([]float64{
@@ -210,7 +253,7 @@ func defaultGRPCServerOpts(logger log.Logger, reg *prometheus.Registry, tracer o
 		return status.Errorf(codes.Internal, "%s", p)
 	}
 	reg.MustRegister(met, panicsTotal)
-	return []grpc.ServerOption{
+	opts := []grpc.ServerOption{
 		grpc.MaxSendMsgSize(math.MaxInt32),
 		grpc_middleware.WithUnaryServerChain(
 			met.UnaryServerInterceptor(),
@@ -223,8 +266,53 @@ func defaultGRPCServerOpts(logger log.Logger, reg *prometheus.Registry, tracer o
 			grpc_recovery.StreamServerInterceptor(grpc_recovery.WithRecoveryHandler(grpcPanicRecoveryHandler)),
 		),
 	}
+
+	if key == "" && cert == "" {
+		if clientCA != "" {
+			return nil, errors.New("when a client CA is used a server key and certificate must also be provided")
+		}
+
+		level.Info(logger).Log("msg", "disabled TLS, key and cert must be set to enable")
+		return opts, nil
+	}
+
+	if key == "" || cert == "" {
+		return nil, errors.New("both server key and certificate must be provided")
+	}
+
+	tlsCfg := &tls.Config{
+		MinVersion: tls.VersionTLS12,
+	}
+
+	tlsCert, err := tls.LoadX509KeyPair(cert, key)
+	if err != nil {
+		return nil, errors.Wrap(err, "server credentials")
+	}
+
+	level.Info(logger).Log("msg", "enabled gRPC server side TLS")
+
+	tlsCfg.Certificates = []tls.Certificate{tlsCert}
+
+	if clientCA != "" {
+		caPEM, err := ioutil.ReadFile(clientCA)
+		if err != nil {
+			return nil, errors.Wrap(err, "reading client CA")
+		}
+
+		certPool := x509.NewCertPool()
+		if !certPool.AppendCertsFromPEM(caPEM) {
+			return nil, errors.Wrap(err, "building client CA")
+		}
+		tlsCfg.ClientCAs = certPool
+		tlsCfg.ClientAuth = tls.RequireAndVerifyClientCert
+
+		level.Info(logger).Log("msg", "gRPC server TLS client verification enabled")
+	}
+
+	return append(opts, grpc.Creds(credentials.NewTLS(tlsCfg))), nil
 }
 
+// TODO Remove once all components are migrated to the new defaultHTTPListener.
 // metricHTTPListenGroup is a run.Group that servers HTTP endpoint with only Prometheus metrics.
 func metricHTTPListenGroup(g *run.Group, logger log.Logger, reg *prometheus.Registry, httpBindAddr string) error {
 	mux := http.NewServeMux()
@@ -240,7 +328,31 @@ func metricHTTPListenGroup(g *run.Group, logger log.Logger, reg *prometheus.Regi
 		level.Info(logger).Log("msg", "Listening for metrics", "address", httpBindAddr)
 		return errors.Wrap(http.Serve(l, mux), "serve metrics")
 	}, func(error) {
-		l.Close()
+		runutil.CloseWithLogOnErr(logger, l, "metric listener")
+	})
+	return nil
+}
+
+// defaultHTTPListener starts a run.Group that servers HTTP endpoint with default endpoints providing Prometheus metrics,
+// profiling and liveness/readiness probes.
+func defaultHTTPListener(g *run.Group, logger log.Logger, reg *prometheus.Registry, httpBindAddr string, readinessProber *prober.Prober) error {
+	mux := http.NewServeMux()
+	registerMetrics(mux, reg)
+	registerProfile(mux)
+	readinessProber.RegisterInMux(mux)
+
+	l, err := net.Listen("tcp", httpBindAddr)
+	if err != nil {
+		return errors.Wrap(err, "listen metrics address")
+	}
+
+	g.Add(func() error {
+		level.Info(logger).Log("msg", "listening for metrics", "address", httpBindAddr)
+		readinessProber.SetHealthy()
+		return errors.Wrap(http.Serve(l, mux), "serve metrics")
+	}, func(err error) {
+		readinessProber.SetNotHealthy(err)
+		runutil.CloseWithLogOnErr(logger, l, "metric listener")
 	})
 	return nil
 }
